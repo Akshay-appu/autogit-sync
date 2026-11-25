@@ -2,7 +2,7 @@
   "name": "autogit-sync",
   "displayName": "AutoGit Sync",
   "description": "Auto-syncs error-free code to GitHub on Ctrl+S",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "engines": {
     "vscode": "^1.146.0"
   },
