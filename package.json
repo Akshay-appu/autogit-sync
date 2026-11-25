@@ -2,7 +2,7 @@
   "name": "autogit-sync",
   "displayName": "AutoGit Sync",
   "description": "Auto-syncs error-free code to GitHub on Ctrl+S",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "engines": {
     "vscode": "^1.146.0"
   },
@@ -18,6 +18,10 @@
       {
         "title": "AutoGit: Connect Folder to GitHub Repo",
         "command": "autogit-sync.connectRepo"
+      },
+      {
+        "title": "AutoGit: Set Gemini API Key (AI Commit Messages)",
+        "command": "autogit-sync.setApiKey"
       }
     ]
   },
