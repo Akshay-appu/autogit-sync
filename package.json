@@ -2,12 +2,13 @@
   "name": "autogit-sync",
   "displayName": "AutoGit Sync",
   "description": "Auto-syncs error-free code to GitHub on Ctrl+S",
-  "version": "0.0.2",
+  "version": "0.0.4",
   "engines": {
     "vscode": "^1.146.0"
   },
   "categories": [
-    "Other"
+    "SCM Providers",
+    "Education"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -18,6 +19,14 @@
       {
         "title": "AutoGit: Connect Folder to GitHub Repo",
         "command": "autogit-sync.connectRepo"
+      },
+      {
+        "title": "AutoGit: Push Entire Folder to GitHub",
+        "command": "autogit-sync.pushFolder"
+      },
+      {
+        "title": "AutoGit: Set Default GitHub Repo (Single Files)",
+        "command": "autogit-sync.setDefaultRepo"
       },
       {
         "title": "AutoGit: Set Gemini API Key (AI Commit Messages)",
@@ -55,5 +64,25 @@
     "diff": "^8.0.4",
     "serialize-javascript": "^7.0.6"
   },
-  "publisher": "akshay"
+  "publisher": "AkshayKumarKN",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "theme": "dark",
+    "color": "#001021"
+  },
+  "author": "Akshay Kumar K N",
+  "license": "MIT",
+  "keywords": [
+    "github",
+    "git",
+    "auto-commit",
+    "auto-push",
+    "sync",
+    "student",
+    "ai"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Akshay-appu/autogit-sync.git"
+  }
 }
