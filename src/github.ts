@@ -1,26 +1,75 @@
 import * as fs from 'fs';
+import * as path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 
-const GITHUB_API = 'https://api.github.com';
+const execFileAsync = promisify(execFile);
+const LFS_THRESHOLD_BYTES = 95 * 1024 * 1024; // 95 MB (GitHub hard REST API limit is 100 MB)
 
 export interface FolderFile {
   relativePath: string;
   fullPath: string;
 }
 
-function headers(token: string) {
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+function encodeRepoPath(repoPath: string): string {
+  return repoPath
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
+function buildHeaders(token: string): Record<string, string> {
   return {
     Authorization: `Bearer ${token}`,
     Accept: 'application/vnd.github+json',
     'Content-Type': 'application/json',
-    'User-Agent': 'autogit-sync-vscode'
+    'User-Agent': 'AutoGit-Sync-VSCode'
   };
 }
 
-export async function getGitHubUsername(token: string): Promise<string> {
-  const res = await fetch(`${GITHUB_API}/user`, { headers: headers(token) });
-  if (!res.ok) {
-    throw new Error('Failed to fetch GitHub profile');
+async function githubFetchWithRetry(
+  url: string,
+  options: RequestInit,
+  maxRetries = 5
+): Promise<Response> {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+    if (res.ok) {
+      return res;
+    }
+
+    const retryable = [403, 429, 502, 503, 504].includes(res.status);
+    if (!retryable || attempt === maxRetries) {
+      const errText = await res.text();
+      throw new Error(`GitHub API ${res.status}: ${errText}`);
+    }
+
+    const retryAfter = Number(res.headers.get('retry-after') || 0);
+    const waitMs = retryAfter > 0 ? retryAfter * 1000 : 1500 * Math.pow(2, attempt);
+    await sleep(waitMs);
   }
+  throw new Error('GitHub request failed after maximum retries.');
+}
+
+async function getDefaultBranch(token: string, owner: string, repo: string): Promise<string> {
+  try {
+    const res = await githubFetchWithRetry(`https://api.github.com/repos/${owner}/${repo}`, {
+      headers: buildHeaders(token)
+    });
+    const data = (await res.json()) as { default_branch?: string };
+    return data.default_branch || 'main';
+  } catch {
+    return 'main';
+  }
+}
+
+export async function getGitHubUsername(token: string): Promise<string> {
+  const res = await githubFetchWithRetry('https://api.github.com/user', {
+    headers: buildHeaders(token)
+  });
   const data = (await res.json()) as { login: string };
   return data.login;
 }
@@ -28,32 +77,29 @@ export async function getGitHubUsername(token: string): Promise<string> {
 export async function ensureRepoExists(
   token: string,
   owner: string,
-  repoName: string,
+  repo: string,
   isPrivate: boolean
 ): Promise<void> {
-  const check = await fetch(`${GITHUB_API}/repos/${owner}/${repoName}`, {
-    headers: headers(token)
-  });
-
-  if (check.ok) {
+  const headers = buildHeaders(token);
+  const checkRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
+  if (checkRes.ok) {
     return;
   }
 
-  const create = await fetch(`${GITHUB_API}/user/repos`, {
+  if (checkRes.status !== 404) {
+    const errText = await checkRes.text();
+    throw new Error(`Failed checking repo (${checkRes.status}): ${errText}`);
+  }
+
+  await githubFetchWithRetry('https://api.github.com/user/repos', {
     method: 'POST',
-    headers: headers(token),
+    headers,
     body: JSON.stringify({
-      name: repoName,
+      name: repo,
       private: isPrivate,
-      auto_init: true,
-      description: 'Auto-synced from VS Code'
+      auto_init: false
     })
   });
-
-  if (!create.ok) {
-    const err = await create.text();
-    throw new Error(`Could not create repo: ${err}`);
-  }
 }
 
 export async function pushFileToGitHub(
@@ -64,31 +110,77 @@ export async function pushFileToGitHub(
   content: string,
   commitMessage: string
 ): Promise<void> {
-  const encodedPath = filePath.split('/').map(encodeURIComponent).join('/');
-  const url = `${GITHUB_API}/repos/${owner}/${repo}/contents/${encodedPath}`;
+  const headers = buildHeaders(token);
+  const branch = await getDefaultBranch(token, owner, repo);
+  const encodedPath = encodeRepoPath(filePath);
+  const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${encodedPath}`;
 
-  let sha: string | undefined;
-  const existing = await fetch(url, { headers: headers(token) });
-  if (existing.ok) {
-    const fileData = (await existing.json()) as { sha: string };
-    sha = fileData.sha;
+  let existingSha: string | undefined;
+  const existingRes = await fetch(`${apiUrl}?ref=${encodeURIComponent(branch)}`, { headers });
+  if (existingRes.ok) {
+    const existingData = (await existingRes.json()) as { sha?: string };
+    existingSha = existingData.sha;
   }
 
-  const base64Content = Buffer.from(content, 'utf8').toString('base64');
-  const res = await fetch(url, {
+  const body: Record<string, string> = {
+    message: commitMessage,
+    content: Buffer.from(content, 'utf8').toString('base64'),
+    branch
+  };
+  if (existingSha) {
+    body.sha = existingSha;
+  }
+
+  await githubFetchWithRetry(apiUrl, {
     method: 'PUT',
-    headers: headers(token),
-    body: JSON.stringify({
-      message: commitMessage,
-      content: base64Content,
-      ...(sha ? { sha } : {})
-    })
+    headers,
+    body: JSON.stringify(body)
   });
+}
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Push failed: ${err}`);
+function resolveWorkspaceRoot(firstFile: FolderFile): string {
+  const normalizedRel = firstFile.relativePath.split('/').join(path.sep);
+  if (firstFile.fullPath.endsWith(normalizedRel)) {
+    return firstFile.fullPath.slice(0, firstFile.fullPath.length - normalizedRel.length).replace(/[\\/]+$/, '');
   }
+  return path.dirname(firstFile.fullPath);
+}
+
+async function pushViaGitLfs(
+  folderPath: string,
+  owner: string,
+  repo: string,
+  branch: string,
+  token: string,
+  largeFiles: FolderFile[],
+  commitMessage: string
+): Promise<void> {
+  const authUrl = `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
+
+  if (!fs.existsSync(path.join(folderPath, '.git'))) {
+    await execFileAsync('git', ['init', '-b', branch], { cwd: folderPath });
+  }
+
+  await execFileAsync('git', ['lfs', 'install'], { cwd: folderPath });
+
+  for (const file of largeFiles) {
+    await execFileAsync('git', ['lfs', 'track', file.relativePath], { cwd: folderPath });
+  }
+
+  await execFileAsync('git', ['add', '-A'], { cwd: folderPath });
+
+  try {
+    await execFileAsync('git', ['commit', '-m', commitMessage], { cwd: folderPath });
+  } catch {
+    // Ignore if working tree has nothing new to commit
+  }
+
+  await execFileAsync('git', ['remote', 'remove', 'origin'], { cwd: folderPath }).catch(() => {});
+  await execFileAsync('git', ['remote', 'add', 'origin', authUrl], { cwd: folderPath });
+  await execFileAsync('git', ['push', '-u', 'origin', branch, '--force'], {
+    cwd: folderPath,
+    maxBuffer: 50 * 1024 * 1024
+  });
 }
 
 export async function pushFolderTreeToGitHub(
@@ -99,104 +191,125 @@ export async function pushFolderTreeToGitHub(
   commitMessage: string,
   onProgress?: (uploaded: number, total: number) => void
 ): Promise<void> {
-  // 1. Get default branch and latest commit SHA
-  const repoRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}`, {
-    headers: headers(token)
-  });
-  if (!repoRes.ok) {
-    throw new Error('Could not read repository metadata');
+  if (files.length === 0) {
+    throw new Error('No files provided to push.');
   }
-  const repoData = (await repoRes.json()) as { default_branch: string };
-  const branch = repoData.default_branch || 'main';
 
-  const refRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/ref/heads/${branch}`, {
-    headers: headers(token)
+  const branch = await getDefaultBranch(token, owner, repo);
+
+  // Automatically hand off to Git + Git LFS if any file exceeds 95 MB
+  const largeFiles = files.filter((file) => {
+    try {
+      return fs.statSync(file.fullPath).size > LFS_THRESHOLD_BYTES;
+    } catch {
+      return false;
+    }
   });
-  if (!refRes.ok) {
-    throw new Error(`Could not find branch "${branch}". Make sure the repo is initialized.`);
+
+  if (largeFiles.length > 0) {
+    const rootDir = resolveWorkspaceRoot(files[0]);
+    await pushViaGitLfs(rootDir, owner, repo, branch, token, largeFiles, commitMessage);
+    onProgress?.(files.length, files.length);
+    return;
   }
+
+  const headers = buildHeaders(token);
+  const apiBase = `https://api.github.com/repos/${owner}/${repo}`;
+
+  // Initialize empty repositories with the first file before using Git Trees API
+  let refRes = await fetch(`${apiBase}/git/ref/heads/${encodeURIComponent(branch)}`, { headers });
+  let startIndex = 0;
+
+  if (refRes.status === 404 || refRes.status === 409) {
+    const firstFile = files[0];
+    onProgress?.(1, files.length);
+    const firstBase64 = fs.readFileSync(firstFile.fullPath).toString('base64');
+
+    await githubFetchWithRetry(`${apiBase}/contents/${encodeRepoPath(firstFile.relativePath)}`, {
+      method: 'PUT',
+      headers,
+      body: JSON.stringify({
+        message: commitMessage,
+        content: firstBase64,
+        branch
+      })
+    });
+
+    if (files.length === 1) {
+      return;
+    }
+
+    startIndex = 1;
+    refRes = await githubFetchWithRetry(`${apiBase}/git/ref/heads/${encodeURIComponent(branch)}`, {
+      headers
+    });
+  } else if (!refRes.ok) {
+    const errText = await refRes.text();
+    throw new Error(`Failed reading branch ref (${refRes.status}): ${errText}`);
+  }
+
   const refData = (await refRes.json()) as { object: { sha: string } };
   const latestCommitSha = refData.object.sha;
 
-  const commitRes = await fetch(
-    `${GITHUB_API}/repos/${owner}/${repo}/git/commits/${latestCommitSha}`,
-    { headers: headers(token) }
-  );
-  if (!commitRes.ok) {
-    throw new Error('Could not read latest commit');
-  }
+  const commitRes = await githubFetchWithRetry(`${apiBase}/git/commits/${latestCommitSha}`, {
+    headers
+  });
   const commitData = (await commitRes.json()) as { tree: { sha: string } };
   const baseTreeSha = commitData.tree.sha;
 
-  // 2. Upload all files as Git blobs in batches of 5
   const treeItems: Array<{ path: string; mode: string; type: string; sha: string }> = [];
-  const batchSize = 5;
 
-  for (let i = 0; i < files.length; i += batchSize) {
-    const batch = files.slice(i, i + batchSize);
-    const results = await Promise.all(
-      batch.map(async (file) => {
-        const base64 = fs.readFileSync(file.fullPath).toString('base64');
-        const blobRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/blobs`, {
-          method: 'POST',
-          headers: headers(token),
-          body: JSON.stringify({ content: base64, encoding: 'base64' })
-        });
-        if (!blobRes.ok) {
-          const err = await blobRes.text();
-          throw new Error(`Failed uploading ${file.relativePath}: ${err}`);
-        }
-        const blobData = (await blobRes.json()) as { sha: string };
-        return {
-          path: file.relativePath,
-          mode: '100644',
-          type: 'blob',
-          sha: blobData.sha
-        };
+  for (let i = startIndex; i < files.length; i++) {
+    const file = files[i];
+    onProgress?.(i + 1, files.length);
+
+    const base64Content = fs.readFileSync(file.fullPath).toString('base64');
+    const blobRes = await githubFetchWithRetry(`${apiBase}/git/blobs`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        content: base64Content,
+        encoding: 'base64'
       })
-    );
+    });
 
-    treeItems.push(...results);
-    if (onProgress) {
-      onProgress(Math.min(i + batchSize, files.length), files.length);
+    const blobData = (await blobRes.json()) as { sha: string };
+    treeItems.push({
+      path: file.relativePath,
+      mode: '100644',
+      type: 'blob',
+      sha: blobData.sha
+    });
+
+    if (i < files.length - 1) {
+      await sleep(150);
     }
   }
 
-  // 3. Create a single tree and single commit pointing to all uploaded files
-  const newTreeRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/trees`, {
+  const newTreeRes = await githubFetchWithRetry(`${apiBase}/git/trees`, {
     method: 'POST',
-    headers: headers(token),
-    body: JSON.stringify({ base_tree: baseTreeSha, tree: treeItems })
+    headers,
+    body: JSON.stringify({
+      base_tree: baseTreeSha,
+      tree: treeItems
+    })
   });
-  if (!newTreeRes.ok) {
-    throw new Error('Failed to create Git tree');
-  }
   const newTreeData = (await newTreeRes.json()) as { sha: string };
 
-  const newCommitRes = await fetch(`${GITHUB_API}/repos/${owner}/${repo}/git/commits`, {
+  const newCommitRes = await githubFetchWithRetry(`${apiBase}/git/commits`, {
     method: 'POST',
-    headers: headers(token),
+    headers,
     body: JSON.stringify({
       message: commitMessage,
       tree: newTreeData.sha,
       parents: [latestCommitSha]
     })
   });
-  if (!newCommitRes.ok) {
-    throw new Error('Failed to create commit');
-  }
   const newCommitData = (await newCommitRes.json()) as { sha: string };
 
-  // 4. Move the branch pointer to the new commit
-  const updateRefRes = await fetch(
-    `${GITHUB_API}/repos/${owner}/${repo}/git/refs/heads/${branch}`,
-    {
-      method: 'PATCH',
-      headers: headers(token),
-      body: JSON.stringify({ sha: newCommitData.sha })
-    }
-  );
-  if (!updateRefRes.ok) {
-    throw new Error('Failed to update branch reference');
-  }
+  await githubFetchWithRetry(`${apiBase}/git/refs/heads/${encodeURIComponent(branch)}`, {
+    method: 'PATCH',
+    headers,
+    body: JSON.stringify({ sha: newCommitData.sha })
+  });
 }
